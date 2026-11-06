@@ -1,144 +1,147 @@
-# Feng (2015) QN-MHP 复现基础
+# 最小 QN-MHP：视觉搜索 TC1–TC9
 
-这是 Feng (2015) 论文第 2–4 章的命令行结构性重建，覆盖独立转向、
-Parked 视觉搜索和实验 1 Driving 双任务。它不是作者 MATLAB/Simulink
-模型的逐参数移植，也尚不能称为“复现成功”。当前重点是建立可检查的
-Figure 4 模块边界、TC 数据流、共享服务器竞争、Figure 23 任务切换和实验指标。
+这是 `simple-qn-mhp` 教学分支。完整的 Driving、车辆动力学和 Performance
+Monitor 实现在 `main` 分支；本分支刻意删除这些模块，只保留：
 
-项目不包含 Web UI、Streamlit 或绘图代码；实验输出为 JSON Lines，Python
-接口同时返回结构化结果和 Driving 车辆轨迹。
+- 信息实体 `Entity`；
+- 算子定义 `OperatorSpec`；
+- 共享服务器 `Server`；
+- 同步队列网络 `QueueNetwork`；
+- Figure 22 视觉搜索 TC1–TC9；
+- 一个普通输入、普通返回值的公开函数。
 
-## Figure 4 对应关系
+它的目标是先看清楚 Entity 怎样在 TC 和 Server 之间流动，不宣称已经复现论文
+完整实验。
 
-- `task_environment.py` — Figure 4(a)
-  - 道路场景、触摸屏、Button、随机 USB 位置、外部视觉刺激、gaze 和动作结果。
-  - 不包含 QN-MHP 服务器或 TC。
-- `vehicle_dynamics.py` — Figure 4(b)
-  - 独立 `VehicleState` 和 Appendix A 车辆更新。
-  - 输入绝对方向盘角与 `dt`，输出 `x`、`z`、`yaw`、near/far angle。
-- `tasks/` — Figure 4(c)
-  - `steering.py`：Figure 6 的 TC1–TC6 和 Salvucci 控制律。
-  - `visual_search.py`：Figure 22 的 TC1–TC9。
-  - `dual_task.py`：Figure 23 Performance Monitor、glance 和暂停/恢复。
-- `cognitive_architecture.py` — Figure 4(d)
-  - 仅包含 `Entity`、`OperatorSpec`、`Server`、`QueueNetwork` 和离散事件调度。
-- `driver_model.py` — Figure 4 虚线框 Driver Model
-  - 创建唯一 QueueNetwork 和算子注册表。
-  - 所有任务共享完全相同的 `1、2/3、4、A、C、W、Y、Z` Server 实例。
-- `model_config.py`
-  - 参数值、来源、注释和待标定状态。
+## 最简单的使用方式
 
-## 队列与 TC 语义
+```python
+from qn_mhp import run_visual_search
 
-`OperatorSpec` 明确保存算子名称、服务器路径、各服务器附加服务需求和动态
-参数规则。响应时间由服务器等待、服务器默认服务时间及算子服务需求共同产生。
-时间参数不塞入 Entity payload。
+result = run_visual_search(
+    ["AM1", "FM1", "USB", "DVD", "AM2", "FM2", "MP3", "CD"],
+    target_label="USB",
+    seed=2,
+)
 
-每个 `Server` 持有自己的 FIFO 队列和当前服务实体；队列不属于算子。因此
-`COMPARE`、`VISUAL_SEARCH` 与 `DETERMINE_STEERING` 使用同一个 C 队列。
-Server 支持可配置容量；当前 Server 4 以容量 4 表达论文的视觉对象识别容量，
-不再使用 `(N-4)×penalty` 线性罚时。
-
-每个 TC 只激活一个论文算子。`_tc...` 方法负责激活，
-`_..._completed` 方法只在服务器完成后提交状态并激活后继 TC。空路径
-`GOTO` 和 `GOAL_ACCOMPLISHED` 仍进入显式算子历史，并在同一仿真时间回调。
-
-Entity 包含任务、类型、创建时间、父 Entity ID 和完整服务器历史。视觉搜索
-的数据链为：
-
-```text
-Button external stimulus
-→ TC1 LOOK_AT → perceived
-→ TC2 STORE_TO_STM → stored
-→ TC3 RETRIEVE_FROM_STM → retrieved
-→ TC4 COMPARE → comparison
-→ TC5 GOTO
-→ TC6 VISUAL_SEARCH 或 TC7 REACH_WITH_HAND
-→ TC8 CLICK_WITH_FINGER
-→ TC9 GOAL_ACCOMPLISHED
+print(result.completion_time_s)
+print(result.clicked_index)
+print(result.examined_indices)
+print(result.tc_trace)
+print(result.server_trace)
 ```
 
-只有 TC1 读取按钮标签。TC7/TC8 使用 Entity 一直携带的位置与宽度，不重新读取
-环境。TC6 总是经过 C，并保存 perfect search memory。
+输入只有按钮标签、目标文字和随机种子。输出是一个 `TrialResult`，包含完成时间、
+点击位置、检查顺序、TC 输入输出记录、全部 Entity 和服务器访问记录。
 
-转向中 50 ms 是环境 road stimulus 的生成间隔；TC6 是任务程序的显式 GOTO。
-两者独立。near/far 在 TC2 的 A 完成后配对，TC3 再显式经过 A，之后才进入 C。
+## 同步 return 风格
 
-## Figure 23 与 Driving 指标
+每个 TC 都是普通函数调用：
 
-Performance Monitor 在视觉搜索 TC5 mismatch、准备进入 TC6 时检查当前
-off-road glance：
+```python
+perceived, time = model.tc1(time, parent=None)
+stored, time = model.tc2(perceived, time)
+retrieved, time = model.tc3(stored, time)
+comparison, time = model.tc4(retrieved, time)
+match, time = model.tc5(comparison, time)
+```
 
-- 未达到阈值：直接继续 TC6。
-- 达到阈值：在 TC6 前暂停，保存 `examined/attention/focus`，切回道路，
-  插入配置数量的完整 Steering TC1–TC6，满足最短 road check 后重新看设备并
-  恢复同一个 TC6。
+没有 callback、Performance Monitor 或事件日历。Server 直接返回完成时间：
 
-Driving 输出：
+```text
+service_start  = max(arrival_time, server_available_time)
+service_finish = service_start + default_service + operator_demand
+```
 
-- Task Completion Time：首次 off-road glance 开始至最后一次 glance 结束。
-- TEORT：所有 off-road glance 时长之和。
-- glance 数和每次时长。
-- long glance 数，严格使用 `duration > 2.0 s`。
-- 检查按钮数、插入驾驶循环数。
-- 完整 `time/x/yaw/steering angle` 轨迹、最终状态和最大绝对横向偏差。
+因此仍然保留排队等待，但使用者看到的是普通同步输入输出。
 
-## 参数来源
+## TC1–TC9 输入输出
 
-`model_config.py` 将参数严格分为：
+- TC1 `LOOK_AT`
+  - 输入：`Button`
+  - 路径：`1 → 2/3 → 4`
+  - 输出：`perceived_button Entity`
+- TC2 `STORE_TO_STM`
+  - 输入：TC1 的 perceived Entity
+  - 路径：`A`
+  - 输出：`stored_button Entity`
+- TC3 `RETRIEVE_FROM_STM`
+  - 输入：TC2 的 stored Entity
+  - 路径：`A`
+  - 输出：`retrieved_button Entity`
+- TC4 `COMPARE`
+  - 输入：TC3 的 retrieved Entity
+  - 路径：`C`
+  - 输出：包含 `match` 的 comparison Entity
+- TC5 `GOTO`
+  - 输入：comparison Entity
+  - 路径：空
+  - 输出：`match → TC7`，`mismatch → TC6`
+- TC6 `VISUAL_SEARCH`
+  - 输入：comparison Entity 和内部 `examined/attention`
+  - 路径：`C`
+  - 输出：下一个 focus Entity
+- TC7 `REACH_WITH_HAND`
+  - 输入：匹配 Entity 携带的按钮位置
+  - 路径：`W → Y → Z`
+  - 输出：`reached_target Entity`
+- TC8 `CLICK_WITH_FINGER`
+  - 输入：TC7 的 reached Entity
+  - 路径：`W → Y → Z`
+  - 输出：`clicked_target Entity`
+- TC9 `GOAL_ACCOMPLISHED`
+  - 输入：TC8 的 clicked Entity
+  - 路径：空
+  - 输出：`done Entity`
 
-- `PAPER_DERIVED`
-  - 50 ms 视觉刺激间隔、视觉识别容量 4、按钮尺寸/间距/布局、800×480 屏幕、
-    USB 目标、near distance 10 m、far THW 4 s、65 mph = 29 m/s、
-    0.3/0.6/0.9/1.2 m 转向初始偏移、每条件 10 次模型重复和 long glance 2 s。
-- `RECONSTRUCTED`
-  - Server/Operator 时间、除 Server 4 外的容量、Fitts/扫视参数、wheelbase、
-    转向增益与限幅、积分步长、Performance Monitor 阈值和 road check 时长。
-  - 这些值只是透明的可运行默认值，不能引用为论文原值。
-- `CALIBRATED`
-  - 当前为空；尚未执行并记录对 Chapter 3 人类数据的参数拟合。
+## Entity 数据链
 
-论文不能唯一确定、当前明确采用重建方案的部分：
+一次成功搜索的实体血缘可以直接通过 `parent_entity_id` 检查：
 
-- 第 4 章文字 STM 没有给出服务器字母；当前按任务规格使用 A。
-- Figure 6 明示 TC3，但正文总路径只列一次 A；当前 TC3 显式第二次经过 A。
-- 论文称 C 可并行低层操作；当前默认 C capacity=1，以实现要求中的共享 FIFO
-  竞争。容量是可配置的。
-- 视觉搜索的精确服务器路由、服务分布、Fitts 系数和扫视方程未给出。
-- Figure 23 的切换阈值、road glance 时长和插入循环数未给出。
-- Appendix A 印刷式 `|R|·sin(α/2)` 与“负 R 表示左转”及 Figure 8 的方向
-  相冲突。代码使用正的弦长保持左转符号，并在参数清单中标记为重建修正。
+```text
+visual_stimulus
+→ perceived_button
+→ stored_button
+→ memory_request
+→ retrieved_button
+→ comparison
+→ search_selection / reached_target
+→ clicked_target
+→ done
+```
 
-## 安装与运行
+`result.tc_trace` 显示每个 TC 的输入/输出 Entity ID；
+`result.server_trace` 显示每次服务器进入、开始、完成和等待时间。
+
+## 命令行
 
 ```bash
 python -m pip install -r requirements.txt
+python run_simple.py --summary-only
+python run_simple.py
 python -m pytest
 python -m ruff check .
-python experiment_steering.py
-python experiment_parked.py
-python experiment_driving.py
 ```
 
-Parked 和 Driving 默认运行 4/8/15 按钮 × small/medium/large 共 9 个条件，
-每条件 10 次，使用固定、可重复的种子。两个入口分别对照 Chapter 3 Table 1
-和 Table 2，并报告 RMSE 与 MAPE。Driving 还输出 Figure 28 对应的
-1/2/>2 glance 比例和 Figure 29 对应的 long-glance 均值。
+完整 JSON 输出：
 
-## 当前验证结果与边界
+```bash
+python run_simple.py \
+  --labels "AM1,FM1,USB,DVD,AM2,FM2,MP3,CD" \
+  --target USB \
+  --seed 2
+```
 
-2026-11-06 的本仓库默认参数运行结果：
+## 文件
 
-- `pytest`：21 个测试全部通过。
-- `ruff`：全部通过。
-- 独立转向：四个论文初始偏移均能在 8 s 内向中心收敛，但轨迹与 Figure 8/9
-  尚未定量数字化比较，转向增益仍是重建值。
-- Parked：RMSE `0.645 s`，MAPE `34.21%`。
-- Driving TCT：RMSE `1.477 s`，MAPE `55.09%`。
-- Driving TEORT：RMSE `1.195 s`，MAPE `50.76%`。
-- 默认批量结果没有产生 long glance，说明当前服务时间和 Performance Monitor
-  参数明显偏快，不能复现 Figure 29。
+- `qn_mhp.py`：全部模型代码。
+- `run_simple.py`：命令行入口。
+- `tests/test_simple_qn_mhp.py`：最小行为测试。
 
-这些偏差被保留并报告，没有通过隐藏结构问题或把重建值伪装成论文参数来贴合
-结果。下一步需要数字化 Figure 8/9、Figure 25–29，并在固定结构与公开目标函数
-下校准 `CALIBRATED` 参数。
+## 模型边界
+
+- 识别容量 4 和 USB 目标来自论文。
+- Server 时间、Operator demand 和固定扫视需求是透明的重建值，不是论文参数。
+- 当前同步 QueueNetwork 要求同一 Server 的请求按到达时间顺序提交。
+- 适合单条视觉搜索 Entity 流和基础 FIFO 演示。
+- 不包含并行离散事件调度、Driving 双任务、车辆、视线切换或实验拟合。
