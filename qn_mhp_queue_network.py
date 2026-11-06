@@ -14,7 +14,6 @@ parameter set. This is a transparent reconstruction, not an exact reproduction.
 from collections import deque
 from dataclasses import dataclass
 import numpy as np
-import matplotlib.pyplot as plt
 
 CONFIG = {
     "dt": 0.01, "visual_interval": 0.05, "duration": 8.0,
@@ -136,27 +135,13 @@ def simulate(x0):
     return {"time":time,"x":x,"z":z,"yaw":yaw,"phi":phi,"theta_near":tn,"theta_far":tf}
 
 def main():
-    results={o:simulate(o) for o in CONFIG["initial_offsets"]}
-    fig,axs=plt.subplots(1,2,figsize=(12,4.8))
-    styles=[":","--","-.", "-"]
-    for (o,r),style in zip(results.items(),styles):
-        axs[0].plot(r["time"],r["x"],color="black",ls=style,lw=2,label=f"Initial offset = {o:.1f} m")
-        axs[1].plot(r["time"],np.rad2deg(r["phi"]),color="black",ls=style,lw=1.8,label=f"Initial offset = {o:.1f} m")
-    axs[0].axhline(0,color="gray",lw=1); axs[1].axhline(0,color="gray",lw=1)
-    axs[0].set(title="QN-MHP queue-network: lateral position",xlabel="Time (s)",ylabel="Lateral position (m)",xlim=(0,8))
-    axs[1].set(title="Steering angle after Server W → Y → Z",xlabel="Time (s)",ylabel="Steering angle (degrees)",xlim=(0,8))
-    for ax in axs: ax.grid(True,alpha=.25); ax.legend(frameon=False)
-    fig.tight_layout(); fig.savefig("qn_mhp_queue_network.png",dpi=200,bbox_inches="tight")
-    columns=[next(iter(results.values()))["time"]]; headers=["time_s"]
-    for o,r in results.items():
-        tag=str(o).replace(".","_")
-        columns += [r["x"],np.rad2deg(r["phi"]),np.rad2deg(r["yaw"]),np.rad2deg(r["theta_near"]),np.rad2deg(r["theta_far"])]
-        headers += [f"x_{tag}_m",f"phi_{tag}_deg",f"yaw_{tag}_deg",f"theta_near_{tag}_deg",f"theta_far_{tag}_deg"]
-    np.savetxt("qn_mhp_queue_network.csv",np.column_stack(columns),delimiter=",",header=",".join(headers),comments="",fmt="%.6f")
-    for o,r in results.items():
-        print(f"initial offset={o:.1f} m; final x={r['x'][-1]:.4f} m; final yaw={np.rad2deg(r['yaw'][-1]):.3f} deg")
+    for o in CONFIG["initial_offsets"]:
+        r = simulate(o)
+        print(
+            f"initial offset={o:.1f} m; final x={r['x'][-1]:.4f} m; "
+            f"final yaw={np.rad2deg(r['yaw'][-1]):.3f} deg"
+        )
     print("NOTE: Service times and controller gains are provisional; see CONFIG.")
-    plt.show()
 
 if __name__=="__main__":
     main()
